@@ -2,161 +2,36 @@ import asyncio
 import json
 import os
 import re     # 检查函数长度
+import uuid   # 添加Trace ID
 from pathlib import Path
+from typing import Dict, List, Any
 
 import aiohttp
 
 from visualizer import AgentVisualizer
-# ==== 工具定义(复用simple_agent) ====
-def read_file(file_path: str) -> str:
-    "读取文件内容"
-    try:
-        content = Path(file_path).read_text(encoding="utf-8")
-        # 限制返回长度(防止超出上下文)
-        return content[:2000] + ("..." if len(content) > 2000 else "")
-    except Exception as e:
-        return f"错误: {e}"
-    
-def list_files(directory: str = ".") -> str:
-    "列出目录文件, 默认为当前目录"
-    try:
-        files = [f.name for f in Path(directory).iterdir() if f.is_file()]
-        result = "\n".join(files[:20])
-        if len(files) > 20:
-            result += f"\n... (共{len (files)} 个文件, 仅显示前20个)"
-        return result
-    except Exception as e:
-        return f"错误: {e}"
-    
-# 新增工具：代码分析
-def analyze_code(file_path: str) -> str:
-    """
-    分析Python代码质量
-    检查: 函数长度、类型注解、异常处理、文档字符串
-    """
-    try: 
-        content = Path(file_path).read_text(encoding="utf-8")
-        issues = []
-        
-        # 1.检查函数长度(超过50行)
-        func_pattern = r'\s*def\s+(\w+)\s*\(' # 正则表达式，匹配def函数
-        lines = content.split("\n")
-        
-        func_starts = {}
-        for i, line in enumerate(lines, 1):
-            match = re.match(func_pattern, line)
-            if match:
-                func_name = match.group(1)
-                func_starts[func_name] = i
-                
-        # 简化: 只检测连续的函数
-        func_names = list(func_starts.keys())
-        for j in range(len(func_names) - 1):
-            func_name = func_names[j]
-            start = func_starts[func_name]
-            end = func_starts[func_names[j + 1]]
-            length = end - start
-            
-            if length > 50:
-                issues.append({
-                    "line": start,
-                    "type": "函数过长",
-                    "severity": "warning",
-                    "detail": f"函数 {func_name} 有 {length} 行(建议<50行)"
-                })
-                
-        # 检查2： 缺少类型注解
-        func_def_pattern = r'def\s+(\w+)\s*\([^)]*\)\s*:'
-        for match in re.finditer(func_def_pattern, content):
-            func_def = match.group(0)
-            func_name = match.group(1)
-            
-            # 排除特殊函数
-            if func_name.startswith("__"):
-                continue
-            
-            if "->" not in func_def:
-                line_num = content[:match.start()].count("\n") + 1
-                issues.append({
-                    "line": line_num,
-                    "type": "缺少返回类型注解",
-                    "severity": "info",
-                    "detail": f"函数 {func_name} 缺少返回类型注解(-> type)"
-                })
-                
-        # 检查3: 缺少异常处理
-        has_risky_ops = any(keyword in content  for keyword in ["open(", "json.loads", "json.load", "requests."])
-        has_try_except = "try:" in content
+from retry_utils import retry, TokenBucket   # 重试机制 + 限流
+from config import Config  # 配置
+from plugins.read_file import ReadFilePlugin
+from plugins.list_files import ListFilesPlugin
+from plugins.analyze_code import AnalyzeCodePlugin
 
-        if has_risky_ops and not has_try_except:
-            issues.append({
-                "line": 1,
-                "type": "缺少异常处理",
-                "severity": "error",
-                "detail": "代码包含可能抛出异常的操作(文件/网络/JSON), 但没有try-except"
-            })
-            
-        # 检查4： 缺少docstring(解释代码)
-        for match in re.finditer(func_def_pattern, content):
-            func_name = match.group(1)
-            
-            # 排除特殊函数
-            if func_name.startswith("__"):
-                continue
-            
-            # 检查函数后150个字符内是否有docstring
-            after_def = content[match.end(): match.end() + 150]
-            if '"""' not in after_def and "'''" not in after_def:
-                line_num = content[:match.start()].count("\n") + 1
-                issues.append({
-                    "line": line_num,
-                    "type": "缺少文档字符串",
-                    "severity": "info",
-                    "detail": f"函数{func_name} 缺少 docstring"
-                })
-                
-        # 返回结果
-        result = {
-            "file": file_path,
-            "total_issues": len(issues),
-            "issues": issues[:15] # 只返回前15个1
-        }
+# 加载所有插件
+def load_plugins():
+    """加载所有插件"""
+    plugins = [
+        ReadFilePlugin(),
+        ListFilesPlugin(),
+        AnalyzeCodePlugin(),
+    ]
+    
+    tools = {}
+    for plugin in plugins:
+        tools[plugin.name] = plugin.to_dict()
         
-        return json.dumps(result, indent=2, ensure_ascii=False)
-    
-    except Exception as e:
-        return f"错误: {e}"
-    
-            
-            
-# ==== 工具注册表 ====
-TOOLS = {
-    "read_file": {
-        "function": read_file,
-        "description": "读取文件内容",
-        "parameters": {
-            "file_path": {"type": "string", "description": "文件路径(相对或绝对)"}
-        },
-        "required": ["file_path"]
-    },
-    "list_files": {
-        "function": list_files,
-        "description": "列出目录中的文件",
-        "parameters": {
-            "directory": {"type": "string", "description": "目录路径，默认为当前目录"}
-        },
-        "required": []
-    },
-    # ==== 新增工具 ====
-    "analyze_code": {
-        "function": analyze_code,
-        "description": "分析 Python 代码质量， 返回问题列表(包括: 函数过长、缺少类型注解、缺少异常处理、缺少文档字符串)",
-        "parameters": {
-            "file_path": {"type": "string", "description": "要分析的Python文件路径"}
-        },
-        "required": ["file_path"]
-    }
-}
+    return tools
+
+# 全局工具注册表
+TOOLS = load_plugins()
 
 # ==== 真实Agent ====
 class RealAgent:
@@ -167,6 +42,15 @@ class RealAgent:
         self.use_fewshot = use_fewshot
         self.history = []
         self.messages = [] # LLM对话历史
+
+        # 初始化限流器
+        self.rate_limiter = TokenBucket(
+            rate=Config.RATE_LIMIT_RATE,
+            capacity=Config.RATE_LIMIT_CAPACITY
+        )
+        
+        # 为每个Agent实例生成唯一的Trace ID
+        self.trace_id = str(uuid.uuid4())[:8]
         
     def _build_tool_schema(self) -> str:
         "构建工具的说明文档(给LLM看)"
@@ -316,11 +200,17 @@ import os
 ━━━━━━━━━━━━━━━━━━━━━━
 """
             return base_prompt + fewshot_examples
-        
+    
+    @retry(
+        max_attempts=3,
+        base_delay=1.0,
+        retryable_exceptions=(aiohttp.ClientError, asyncio.TimeoutError, Exception)
+    )    
     async def think(self, task: str, observation: str = None) -> dict:
         "调用 LLM 推理"
         # 第一次调用: 初始化信息
         if not self.messages:
+            print(f"🔍 [Trace: {self.trace_id}] 新任务开始: {task[:50]}...")
             self.messages.append({
                 "role": "system",
                 "content": self._get_system_prompt()
@@ -337,8 +227,9 @@ import os
                 "content": f"工具执行结果：\n{observation}\n\n请继续思考下一步，或者如果任务完成就返回 finish。"
             })
             
-        # 调用DeepSeek API
-        try: 
+        # 限流控制
+        async with self.rate_limiter:
+            # 调用DeepSeek API(retry代替了原来的try-except)
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.api_url,
@@ -357,7 +248,7 @@ import os
                     if resp.status != 200:
                         error_text = await resp.text()
                         raise Exception(f"API 错误 {resp.status}: {error_text}")
-                    
+
                     result = await resp.json()
                     response = result["choices"][0]["message"]["content"]
 
@@ -369,23 +260,9 @@ import os
 
                     # 解析 JSON
                     decision = self._parse_response(response)
+                    print(f"✅ [Trace: {self.trace_id}] API 调用成功")
                     return decision
-                
-        except asyncio.TimeoutError:
-            return {
-                "thought": "API调用超时",
-                "action": "finish",
-                "action_input": {"answer": "错误: API超时"}
-            }
-            
-        except Exception as e:
-            print(f"❌ API 调用失败: {e}")
-            return{
-                "thought": f"调用失败: {str(e)}",
-                "action": "finish",
-                "action_input": {"answer": f"错误: {str(e)}"}
-            }
-            
+             
     def _parse_response(self, response: str) -> dict:
         "解析 LLM 返回的 JSON"
         try:
