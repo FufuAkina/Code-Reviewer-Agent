@@ -110,11 +110,15 @@ class TaskState:
         
     def mark_completed(self):
         """标记任务完成"""
+        if self.status != "running":
+            raise ValueError(f"只能从running状态标记为completed, 当前状态: {self.status}")
         self.status = "completed"
         self.last_update_time = datetime.now().isoformat()
         
     def mark_failed(self, reason: str):
         """标记任务失败"""
+        if self.status != "running":
+            raise ValueError(f"只能从running状态标记为failed, 当前状态: {self.status}")
         self.status = "failed"
         self.last_error = reason
         self.last_update_time = datetime.now().isoformat()
@@ -260,3 +264,4 @@ class TaskState:
             是否应该放弃
         """
         return self.error_count >= max_errors
+    

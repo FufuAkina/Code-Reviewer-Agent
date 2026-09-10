@@ -30,7 +30,7 @@ class EventTracker:
             event_type="api_call",
             timestamp=datetime.now().isoformat(),
             data={
-                "model": "model",
+                "model": model,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,

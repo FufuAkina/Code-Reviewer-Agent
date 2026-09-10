@@ -1265,10 +1265,348 @@ CodeAgent/
 
 ```
 
-  
+### **测试覆盖**
+
+项目采用**pytest**框架，实现了完整的**单元测试**和**集成测试**，覆盖核心模块功能。
+
+#### **测试架构（测试金字塔）**
+
+
+    /\
+   /E2E\      ← 10% (端到端测试 - 未来实现)
+  /------\
+ /Integration\ ← 20% (集成测试 - 8个)
+/------------\
+/  Unit Tests  \ ← 70% (单元测试 - 26个)
+/----------------\
+
+
 
 ---
 
-  
+#### **1. 单元测试（26个测试）**
+
+**测试模块：EventTracker（12个测试）**
+
+📁 `tests/test_event_tracker.py`
+
+**测试内容**：
+- ✅ 基本事件记录（API调用、工具调用、错误、步骤）
+- ✅ 统计计算（token累加、平均耗时、成功率）
+- ✅ 空事件列表的除零保护
+- ✅ 按字段分组统计（按工具名、按错误类型）
+- ✅ 文件导出（stats.json + events.json）
+- ✅ 边界值测试（时长转换精度、事件顺序保持）
+
+**运行测试**：
+```bash
+pytest tests/test_event_tracker.py -v
+关键测试场景：
+
+
+# 测试空列表的除零保护
+def test_get_stats_empty():
+    tracker = EventTracker("empty")
+    stats = tracker.get_stats()
+    assert stats["api_calls"]["avg_duration_ms"] == 0  # 不崩溃
+    assert stats["api_calls"]["success_rate"] == 100.0  # 默认100%
+
+# 测试成功率计算
+def test_get_stats_api_calls(tracker):
+    tracker.log_api_call(model="m1", ..., success=True)
+    tracker.log_api_call(model="m2", ..., success=True)
+    tracker.log_api_call(model="m3", ..., success=False)
+    
+    stats = tracker.get_stats()
+    assert stats["api_calls"]["success_rate"] == 66.67  # 2/3 * 100
+测试模块：ContextManager（14个测试）
+
+📁 tests/test_context_manager.py
+
+测试内容：
+
+✅ Token粗略估算（len(text) // 2）
+✅ 消息列表token统计（content + metadata开销）
+✅ 压缩策略：保留system + 最近N条
+✅ 无system消息时的压缩
+✅ 极端情况：保留部分仍超限时的熔断机制
+✅ 空消息、单条消息的边界测试
+✅ 不同配置参数的压缩结果
+✅ tiktoken初始化失败时的回退
+✅ 真实对话场景（30轮对话压缩）
+✅ metadata开销验证（每条消息+4 tokens）
+运行测试：
+
+
+pytest tests/test_context_manager.py -v
+关键测试场景：
+
+
+# 测试压缩策略：保留system + 最近3条
+def test_compress_keep_system_and_recent(manager):
+    messages = [
+        {"role": "system", "content": "A" * 10},
+        {"role": "user", "content": "B" * 20},
+        {"role": "assistant", "content": "C" * 20},
+        {"role": "user", "content": "D" * 20},
+        {"role": "assistant", "content": "E" * 20},
+        {"role": "user", "content": "F" * 20},     # 最近3条
+        {"role": "assistant", "content": "G" * 20},
+        {"role": "user", "content": "H" * 20},
+    ]
+    
+    result = manager.compress(messages)
+    
+    assert len(result) == 4  # system + 最近3条
+    assert result[0]["role"] == "system"
+    assert result[-1]["content"] == "H" * 20  # 最新的保留
+
+# 测试熔断机制：保留部分仍超限
+def test_compress_extreme_case(manager):
+    # 每条消息约54 tokens，3条 = 162 > 100 max_tokens
+    messages = [
+        {"role": "system", "content": "S" * 100},
+        {"role": "user", "content": "A" * 100},
+        {"role": "assistant", "content": "B" * 100},
+        {"role": "user", "content": "C" * 100},
+    ]
+    
+    result = manager.compress(messages)
+    
+    # 熔断：keep_recent // 2 = 3 // 2 = 1
+    assert len(result) == 2  # system + 最近1条
+2. 集成测试（8个测试）
+测试模块：AgentHarness（8个测试）
+
+📁 tests/test_agent_harness.py
+
+测试目的：验证AgentHarness协调5个模块的能力（ModelAdapter、ToolRegistry、TaskState、EventTracker、ContextManager）
+
+Mock边界设计：
+
+
+✅ Mock: ModelAdapter（外部LLM API调用）
+✅ Mock: Tool.execute()（外部IO操作）
+❌ 真实: ToolRegistry（测试工具注册逻辑）
+❌ 真实: TaskState（测试状态更新）
+❌ 真实: EventTracker（测试事件记录）
+❌ 真实: ContextManager（测试上下文压缩）
+运行测试：
+
+
+pytest tests/test_agent_harness.py -v
+测试场景详解：
+
+测试1：Happy Path - 正常完成任务
+
+
+async def test_happy_path_task_completion(agent_harness, mock_model_adapter):
+    """场景：LLM调用工具后完成任务"""
+    # Mock LLM返回：调用工具 → 返回finish
+    mock_model_adapter.chat.side_effect = [
+        ModelResponse(content='{"action": "search_web", ...}', ...),
+        ModelResponse(content='{"action": "finish", ...}', ...)
+    ]
+    
+    result = await agent_harness.run("帮我搜索test")
+    
+    # 验证任务完成
+    assert result.status == "completed"
+    assert len(result.completed_steps) == 1
+    
+    # 验证EventTracker记录
+    stats = agent_harness.event_tracker.get_stats()
+    assert stats["api_calls"]["count"] == 2
+    assert stats["tool_calls"]["count"] == 1
+测试2：工具失败后LLM重试
+
+
+async def test_tool_failure_with_retry(agent_harness, mock_model_adapter):
+    """场景：工具失败 → LLM看到错误 → 重试另一个工具"""
+    mock_model_adapter.chat.side_effect = [
+        ModelResponse(content='{"action": "fail_tool", ...}', ...),
+        ModelResponse(content='{"action": "search_web", ...}', ...),
+        ModelResponse(content='{"action": "finish", ...}', ...)
+    ]
+    
+    result = await agent_harness.run("测试工具失败")
+    
+    # 验证成功率
+    stats = agent_harness.event_tracker.get_stats()
+    assert stats["tool_calls"]["success_rate"] == 50.0  # 1成功1失败
+测试3：错误熔断（连续3次错误）
+
+
+async def test_max_errors_abort(agent_harness, mock_model_adapter):
+    """场景：LLM连续3次抛出异常 → 熔断"""
+    mock_model_adapter.chat.side_effect = [
+        Exception("API超时1"),
+        Exception("API超时2"),
+        Exception("API超时3")
+    ]
+    
+    result = await agent_harness.run("测试错误熔断")
+    
+    assert result.status == "failed"
+    assert result.error_count == 3
+测试4：达到最大步数
+
+
+async def test_max_steps_reached(agent_harness, mock_model_adapter):
+    """场景：LLM连续10次都不返回finish → 达到max_steps"""
+    mock_model_adapter.chat.return_value = ModelResponse(
+        content='{"action": "search_web", ...}', ...
+    )
+    
+    result = await agent_harness.run("测试最大步数")
+    
+    assert result.status == "max_steps_reached"
+    assert len(result.completed_steps) == 10
+测试5：无效JSON回退机制
+
+
+async def test_invalid_json_fallback(agent_harness, mock_model_adapter):
+    """场景：LLM返回无效JSON → 回退为finish"""
+    mock_model_adapter.chat.return_value = ModelResponse(
+        content="我无法生成JSON，抱歉",  # 不是JSON
+        ...
+    )
+    
+    result = await agent_harness.run("测试无效JSON")
+    
+    # _parse_json()会回退为finish动作
+    assert result.status == "completed"
+测试6：上下文压缩触发
+
+
+async def test_context_compression_triggered(agent_harness, mock_model_adapter):
+    """场景：对话超限 → ContextManager压缩"""
+    # 创建低阈值的agent_harness
+    agent_harness = AgentHarness(
+        max_context_tokens=200,  # 降低阈值
+        ...
+    )
+    
+    # Mock 5次工具调用 + 1次finish
+    mock_model_adapter.chat.side_effect = [
+        ModelResponse(...) for _ in range(5)
+    ] + [ModelResponse(content='{"action": "finish", ...}', ...)]
+    
+    result = await agent_harness.run("测试上下文压缩")
+    
+    # 验证messages被压缩
+    assert len(agent_harness.messages) < 13  # 原本13条
+    assert agent_harness.messages[0]["role"] == "system"  # system保留
+测试7：状态和报告保存
+
+
+async def test_state_and_reports_saved(agent_harness, mock_model_adapter):
+    """场景：验证文件持久化"""
+    mock_model_adapter.chat.return_value = ModelResponse(
+        content='{"action": "finish", ...}', ...
+    )
+    
+    result = await agent_harness.run("测试文件保存")
+    
+    # 验证TaskState保存
+    state_file = agent_harness.save_dir / f"{result.task_id}.json"
+    assert state_file.exists()
+    
+    # 验证EventTracker报告
+    reports_dir = Path("harness_reports")
+    assert (reports_dir / f"{result.task_id}_stats.json").exists()
+    assert (reports_dir / f"{result.task_id}_events.json").exists()
+测试8：调用不存在的工具
+
+
+async def test_nonexistent_tool(agent_harness, mock_model_adapter):
+    """场景：LLM调用未注册的工具 → 不崩溃"""
+    mock_model_adapter.chat.side_effect = [
+        ModelResponse(content='{"action": "unknown_tool", ...}', ...),
+        ModelResponse(content='{"action": "finish", ...}', ...)
+    ]
+    
+    result = await agent_harness.run("测试不存在的工具")
+    
+    # 任务完成（虽然工具失败）
+    assert result.status == "completed"
+    
+    # EventTracker记录了失败
+    stats = agent_harness.event_tracker.get_stats()
+    assert stats["tool_calls"]["success_rate"] == 0.0
+3. 运行所有测试
+
+# 运行所有测试
+pytest tests/ -v
+
+# 运行特定模块
+pytest tests/test_event_tracker.py -v
+pytest tests/test_context_manager.py -v
+pytest tests/test_agent_harness.py -v
+
+# 查看测试覆盖率
+pytest tests/ --cov=harness --cov-report=html
+
+# 只运行集成测试
+pytest tests/test_agent_harness.py -v
+
+# 只运行单元测试
+pytest tests/test_event_tracker.py tests/test_context_manager.py -v
+预期输出：
+
+
+tests/test_event_tracker.py::test_log_api_call PASSED                           [  3%]
+tests/test_event_tracker.py::test_log_tool_call PASSED                          [  6%]
+...
+tests/test_context_manager.py::test_compress_keep_system_and_recent PASSED      [ 60%]
+...
+tests/test_agent_harness.py::test_happy_path_task_completion PASSED             [ 85%]
+tests/test_agent_harness.py::test_tool_failure_with_retry PASSED                [ 90%]
+...
+
+========================= 34 passed in 1.23s =========================
+4. 测试设计原则
+单元测试（EventTracker、ContextManager）：
+
+✅ 隔离性：Mock所有外部依赖
+✅ 快速：每个测试 < 10ms
+✅ 边界值：测试0、1、max、负数等边界
+✅ 异常：测试除零、空列表等异常
+集成测试（AgentHarness）：
+
+✅ 真实协作：使用真实的内部模块
+✅ Mock边界：只Mock外部IO（LLM API、文件操作）
+✅ 场景覆盖：正常、异常、边界、并发
+✅ 验证3层：业务逻辑 + 模块协作 + 副作用（文件保存）
+5. 测试覆盖的关键场景
+场景类型	测试数量	代表测试
+正常流程	8个	Happy path、工具调用、统计计算
+错误处理	6个	工具失败、API超时、无效JSON
+边界值	8个	空列表、单条消息、最大步数
+资源管理	4个	上下文压缩、文件保存、熔断
+数据正确性	8个	成功率计算、token累加、事件顺序
+6. 未覆盖的场景（未来计划）
+以下场景留待端到端测试实现：
+
+并发测试：多个agent同时运行
+性能测试：10000次调用的内存泄漏
+真实LLM调用：测试模型真实响应
+真实工具调用：测试文件IO、网络请求
+长时间运行：测试超时、重连机制
+7. 测试文件输出
+测试执行后会生成以下目录（已加入.gitignore）：
+
+
+CodeAgent/
+├── harness_states/          # TaskState持久化文件
+│   └── {task_id}.json
+├── harness_reports/         # EventTracker报告
+│   ├── {task_id}_stats.json
+│   └── {task_id}_events.json
+├── test_states/             # 测试用状态快照
+└── .pytest_cache/           # pytest缓存
+
+
+---
 
 **🎉 感谢使用 CodeAgent！**
