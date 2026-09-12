@@ -17,7 +17,7 @@ class DeepSeekAdapter(ModelAdapter):
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.0,
-        max_tokens: int = 500
+        max_tokens: int = 2048
     ) -> ModelResponse:
         """调用DeepSeek API
         

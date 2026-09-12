@@ -52,3 +52,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Docker
+docker-compose.override.yml
